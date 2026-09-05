@@ -1,10 +1,18 @@
 PYTHON ?= python3
-export REVIEW_PROMPT REVIEW_MODEL REVIEW_TIMEOUT
+export REVIEW_REPO REVIEW_PROMPT REVIEW_FOCUS REVIEW_MODEL REVIEW_TIMEOUT
 
 .PHONY: review check
 
-review: ## Run the inspected review packet with Claude
-	$(PYTHON) plugins/claude-adversarial-review/scripts/review.py --prompt-file "$$REVIEW_PROMPT" --model "$${REVIEW_MODEL:-opus}" --timeout "$${REVIEW_TIMEOUT:-300}" < /dev/null
+review: ## Review a repository or explicitly supplied packet with Claude
+	@if [ -n "$$REVIEW_PROMPT" ]; then \
+	  $(PYTHON) plugins/claude-adversarial-review/scripts/review.py --prompt-file "$$REVIEW_PROMPT" --focus "$${REVIEW_FOCUS:-}" --model "$${REVIEW_MODEL:-opus}" --timeout "$${REVIEW_TIMEOUT:-300}" < /dev/null; \
+	else \
+	  $(PYTHON) plugins/claude-adversarial-review/scripts/review.py --repo "$${REVIEW_REPO:-.}" --focus "$${REVIEW_FOCUS:-}" --model "$${REVIEW_MODEL:-opus}" --timeout "$${REVIEW_TIMEOUT:-300}" < /dev/null; \
+	fi
 
-check: ## Validate the packet and command without calling Claude
-	$(PYTHON) plugins/claude-adversarial-review/scripts/review.py --prompt-file "$$REVIEW_PROMPT" --model "$${REVIEW_MODEL:-opus}" --timeout "$${REVIEW_TIMEOUT:-300}" --dry-run < /dev/null
+check: ## Inspect scope or packet without calling Claude
+	@if [ -n "$$REVIEW_PROMPT" ]; then \
+	  $(PYTHON) plugins/claude-adversarial-review/scripts/review.py --prompt-file "$$REVIEW_PROMPT" --focus "$${REVIEW_FOCUS:-}" --model "$${REVIEW_MODEL:-opus}" --timeout "$${REVIEW_TIMEOUT:-300}" --dry-run < /dev/null; \
+	else \
+	  $(PYTHON) plugins/claude-adversarial-review/scripts/review.py --repo "$${REVIEW_REPO:-.}" --focus "$${REVIEW_FOCUS:-}" --model "$${REVIEW_MODEL:-opus}" --timeout "$${REVIEW_TIMEOUT:-300}" --dry-run < /dev/null; \
+	fi

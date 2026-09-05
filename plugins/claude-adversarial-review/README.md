@@ -1,96 +1,126 @@
-# Claude Adversarial Review plugin
+# Claude Adversarial Review runner
 
-Run an independent, scoped Claude review from Codex using an inspected evidence
-packet. See the [repository README](https://github.com/errajibadr/claude-adversarial-review) for installation and the
-optional Claude Code integration.
+Select a Git review scope, prepare bounded evidence, and let Claude inspect it
+independently. The [skill](skills/claude-adversarial-review/SKILL.md) defines the
+host workflow. See the [repository README](https://github.com/errajibadr/claude-adversarial-review)
+for installation and the optional reverse review command.
 
-## Prepare the evidence
+## Select scope and inspect evidence
 
-Follow the [skill](skills/claude-adversarial-review/SKILL.md) and fill in the
-[prompt template](prompts/adversarial-review.md). Include the intended behavior,
-selected review lenses, scoped diff, relevant line-numbered source, contracts,
-and check results. Include staged, unstaged, and relevant untracked changes.
-
-Write the packet to a private UTF-8 file outside Git. Inspect it before sending:
-the runner does not collect files or redact secrets. Exclude credentials,
-private data, unrelated work, ignored artifacts, and machine-local paths. The
-maximum packet size is 512 KiB. Split larger work into coherent units while
-retaining the context needed to review shared interfaces.
-
-Claude receives this packet with no tools. It cannot inspect additional files,
-run tests, or operate a browser. Include existing browser-check evidence for
-frontend work and state any verification gaps explicitly.
-
-## Run the review
-
-Prerequisites: Python 3.12+ and an installed, authenticated Claude Code CLI that
-supports the required safety flags. No Python package dependencies are needed.
-Check `claude --version` and `claude auth status` if availability is uncertain.
-
-From a source checkout, set `review_prompt` to the inspected packet's location:
+Resolve `scripts/review.py` from the installed plugin, not the project being
+reviewed. From a source checkout:
 
 ```bash
 python3 plugins/claude-adversarial-review/scripts/review.py \
-  --prompt-file "$review_prompt" --model opus --timeout 300 --dry-run < /dev/null
+  --repo "$review_repo" --scope auto --focus 'Security and performance' \
+  --dry-run < /dev/null
+```
 
+Remove `--dry-run` only after inspecting the selected paths, omissions, and
+candidate evidence for secrets or private data. No model is called and no
+artifacts are written during the dry run. It prints inventory metadata, not file
+bodies. There is no automatic content redaction.
+
+| Option | Meaning |
+| --- | --- |
+| `--repo` | Target Git repository; defaults to the current directory. |
+| `--scope auto` | Dirty working tree, otherwise a branch comparison. |
+| `--scope working-tree` | Staged, unstaged, and untracked changes. |
+| `--scope branch` | Compare the merge base with HEAD. |
+| `--base REF` | Explicit branch base; overrides scope. |
+| `--path PATH` | Repeat to restrict changed targets to task files/directories; supporting tracked source remains available. |
+| `--exclude GLOB` | Repeat to omit private/irrelevant paths from diffs and source. |
+| `--focus TEXT` | Preserve the user's review priorities and accepted constraints. |
+| `--prompt-file FILE` | Explicit packet-only review; incompatible with repository scope options. |
+| `--model MODEL` | Default `opus`; requested aliases/provider IDs are recorded alongside the actual returned model. |
+| `--timeout SECONDS` | Positive finite deadline; default 300. |
+| `--output-dir DIR` | Existing parent for a new private run directory; default system temp. |
+| `--dry-run` | Validate and show planned scope/flags without calling Claude. |
+
+Default branch detection uses origin's HEAD then main/master/trunk candidates.
+The resolved target and revision are recorded. For a branch the source snapshot
+comes from HEAD even when the checkout has unrelated edits. Working-tree reviews
+retain staged and unstaged changes, including changes that cancel each other.
+When paths narrow the scope, unrelated dirty supporting files use HEAD content;
+those substitutions are listed in the inventory. Ignore rules from the current
+checkout remain a privacy filter even for branch snapshots.
+
+Snapshots contain selected patches and bounded supporting tracked text source,
+plus selected untracked files. Up to two changed files and 256 KiB of diff are
+included inline. Larger reviews give Claude an inventory and patch files to
+inspect with Read, Glob, and Grep. Omitted files and collection limits are
+recorded. Source limits are 512 KiB per file, 16 MiB total, and 4,096 files;
+diffs are capped at 512 KiB each and 8 MiB total. No Git database or unsafe
+symlinks are copied. Git collection disables
+external diff/text conversion and filesystem monitor execution.
+
+## Packet-only mode
+
+For a design or carefully curated evidence, prepare a private UTF-8 packet with
+the [prompt](prompts/adversarial-review.md) as guidance. Include intended behavior,
+explicit scope, line-numbered source, contracts, and existing check results.
+Inspect its contents; the runner does not sanitize it. Maximum size: 512 KiB.
+
+```bash
 python3 plugins/claude-adversarial-review/scripts/review.py \
   --prompt-file "$review_prompt" --model opus --timeout 300 < /dev/null
 ```
 
-For an installed plugin, resolve `scripts/review.py` from the installed plugin
-directory. The skill resolves it relative to its own location; do not substitute
-a similarly named script from the project under review. The source checkout
-also provides `make check` and `make review` shortcuts.
+Packet mode grants no tools and cannot discover missing source. Do not combine
+it with repository scope options. It still uses the structured review contract.
 
-Useful options:
+## Results and background execution
 
-| Option | Purpose |
-| --- | --- |
-| `--prompt-file` | Path to the inspected evidence packet. |
-| `--model` | Requested model; defaults to `opus`. |
-| `--timeout` | Maximum runtime in seconds; defaults to 300. |
-| `--output-dir` | Existing parent directory for a unique run directory; defaults to system temp. |
-| `--dry-run` | Validate input and inspect the planned invocation without calling a model. |
+The host can run this CLI in the foreground or with its native background
+facility. Retain the host process/session handle for status, completion, and
+cancellation. This plugin does not recreate OpenAI's app-server job registry.
 
-`sonnet`, `fable`, and provider-qualified model IDs are explicit alternatives when
-supported by the configured provider. Aliases can resolve differently over
-time or across providers. Inspect the returned model metadata instead of
-assuming a specific model version. Account usage and billing apply.
+The runner's private artifact directory contains execution metadata, the raw
+Claude response, stderr diagnostics, the original structured `review.json`, and
+rendered `review.md`. Repository reviews also retain their prepared context.
+Keep artifacts outside Git; they can contain private source and model output.
 
-## Read the result
+Require both a successful process and valid `structured_output`. The runner
+validates verdict, finding fields, location ranges, confidence, and coverage
+limits. `approve`, `needs-attention`, and `insufficient-context` are distinct
+verdicts. Material target omissions cannot silently become approval.
 
-The runner prints the private artifact directory. It contains:
+- Exit 0: structurally valid, completed review; read its verdict and findings.
+- Exit 1: execution or result validation failed.
+- Exit 2: insufficient context; resolve coverage gaps before treating work as reviewed.
+- Exit 130: interrupted; the reviewer process is stopped and the run is incomplete.
 
-- `review.md`: the review text when a successful result is available.
-- `response.json`: the Claude CLI response.
-- `stderr.log`: CLI diagnostics.
-- `metadata.json`: execution status and requested/returned model information.
+Return or link the original report unchanged. Keep the implementing agent's
+interpretation separate. Findings are recommendations to validate, not commands.
+Review workers do not apply fixes or call another reviewer.
 
-Require a successful response envelope as well as a successful process status.
-An authentication error, timeout, malformed response, or CLI failure is a failed
-review. A successful response may still report findings or insufficient context.
-Neither should be presented as approval. Treat findings as recommendations to
-validate, then let the implementing agent handle confirmed fixes.
+## Runtime boundaries
 
-## Execution boundaries
+Prerequisites: Python 3.12+, Git for repository mode, and authenticated Claude
+Code supporting `--safe-mode` and `--restricted` (restricted requires 2.1.248+).
+No Python dependencies are needed. Working-tree source collection requires
+POSIX no-follow file access, as available on macOS and Linux; unsupported
+platforms report omitted source instead of weakening the file-opening rules.
 
-The runner uses Claude's print mode with tools disabled, an empty strict MCP
-configuration, `dontAsk` permission mode, no session persistence, and safe mode.
-This disables hooks, plugins, and automatic instruction loading while retaining
-authentication and managed policies. It closes stdin after the finite packet,
-uses subprocess arguments without a shell, and bounds execution time.
+Repository mode launches Claude with its working directory set to the prepared
+snapshot. Restricted mode confines its built-in file tools to working directories;
+only Read, Glob, and Grep are granted. Packet mode has no tools. Both modes use
+safe mode, strict empty MCP configuration, explicit MCP denial, `dontAsk`, no
+session persistence, JSON output, and a JSON schema. User/repository
+customizations are suppressed while authentication and managed policies,
+including managed hooks, remain in effect.
 
-See the official [CLI reference](https://code.claude.com/docs/en/cli-reference)
-and [model configuration documentation](https://code.claude.com/docs/en/model-config).
-If an older CLI rejects the required flags, update it separately; do not remove
-the safety flags to make a review run.
+The CLI runs locally; model inference uses your configured remote provider.
+These controls are not complete OS isolation or automatic secret sanitization.
+The reviewer cannot run tests or a browser, so include existing verification
+results and disclose missing checks.
 
-Local execution still sends the packet to the configured remote provider. This
-workflow restricts reviewer capabilities; it is not a claim of complete OS
-isolation or automatic data sanitization.
+If an older CLI rejects required flags, update it separately instead of removing
+controls. If an enclosing Codex sandbox hides a working login, use normal
+approval-controlled execution for the same restricted invocation when allowed.
+Never copy credentials, bypass permissions, or disable TLS verification. A
+blocked invocation remains a blocked review.
 
-An enclosing Codex sandbox may make an existing Claude login unavailable. Use
-the host's normal approval-controlled execution for the same restricted command
-when permitted. Preserve all safety flags and never copy credentials or disable
-TLS verification. If execution remains blocked, report the limitation and keep
-the prepared packet available for an approved terminal invocation.
+Primary documentation: [Claude CLI reference](https://code.claude.com/docs/en/cli-reference),
+[permissions](https://code.claude.com/docs/en/permissions), and
+[structured outputs](https://code.claude.com/docs/en/agent-sdk/structured-outputs).
