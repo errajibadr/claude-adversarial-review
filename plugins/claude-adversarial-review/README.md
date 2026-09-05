@@ -3,7 +3,7 @@
 Select a Git review scope, prepare bounded evidence, and let Claude inspect it
 independently. The [skill](skills/claude-adversarial-review/SKILL.md) defines the
 host workflow. See the [repository README](https://github.com/errajibadr/claude-adversarial-review)
-for installation and the optional reverse review command.
+for Codex installation and direct use from other coding assistants.
 
 ## Select scope and inspect evidence
 
@@ -126,9 +126,6 @@ Excluded path names can appear in the inventory even when their contents are
 omitted. Use an inspected packet when file names themselves are sensitive.
 Public `AGENTS.md`/`CLAUDE.md` source may be reviewed as data under safe mode;
 private local instructions and customization state directories are excluded.
-The optional Codex fallback has different read boundaries, documented in its
-command; its shell operates under Codex's read-only sandbox without a filesystem
-read allowlist for the snapshot.
 The reviewer cannot run tests or a browser, so include existing verification
 results and disclose missing checks.
 

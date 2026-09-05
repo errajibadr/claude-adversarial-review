@@ -1,6 +1,6 @@
 ---
 name: claude-adversarial-review
-description: Obtain an independent adversarial Claude review while Codex implements. Use for security, performance, code correctness, frontend, accessibility, architecture, or reliability review. Selects Git changes, permits read-only inspection of a prepared source snapshot, and returns structured findings without applying fixes. Also supports explicit packet-only reviews.
+description: Obtain an independent adversarial Claude review while another coding assistant implements. Use for security, performance, code correctness, frontend, accessibility, architecture, or reliability review. Selects Git changes, permits read-only inspection of a prepared source snapshot, and returns structured findings without applying fixes. Also supports explicit packet-only reviews.
 ---
 
 # Claude adversarial review

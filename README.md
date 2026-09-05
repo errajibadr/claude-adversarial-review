@@ -1,7 +1,9 @@
 # Claude Adversarial Review
 
-Independent Claude review of work done in Codex, with security, performance,
-code correctness, frontend, accessibility, architecture, and other review lenses.
+Independent Claude review for Codex and other coding assistants, with security,
+performance, code correctness, frontend, accessibility, architecture, and other
+review lenses. The repository provides a Codex plugin and a standalone Python
+runner that other assistants can invoke directly.
 
 The reviewer can inspect a prepared source snapshot with read tools. The runner
 selects Git changes and validates structured findings before reporting a verdict.
@@ -47,7 +49,7 @@ Check `claude --version` and `claude auth status`.
 > Review this branch against main. Challenge the checkout design and check
 > frontend behavior, accessibility, and failure recovery.
 
-Codex inspects the scope and exclusions, launches Claude, and returns its original
+The calling assistant inspects the scope and exclusions, launches Claude, and returns its original
 report with coverage limits. `opus` is the default alias; another alias or full
 provider model ID can be explicitly requested. Results record the actual model.
 Your configured account's usage and billing apply.
@@ -69,12 +71,17 @@ This project follows the review-quality practices in OpenAI's
 There are deliberate runtime differences: OpenAI uses Codex's app server with
 read-only Git access in the checkout and its own job registry. This plugin uses
 Claude's CLI with a bounded source snapshot and host-managed jobs. It retains
-an explicit packet-only mode and a configurable timeout. The Claude outer
-sandbox workaround below is a separate compatibility adaptation.
+an explicit packet-only mode and a configurable timeout.
 
-## Run from a source checkout
+## Use the runner directly
 
-Set `review_repo` to the repository you want reviewed:
+Other coding assistants can follow the
+[skill](plugins/claude-adversarial-review/skills/claude-adversarial-review/SKILL.md)
+and invoke the runner directly. Resolve the runner from this package and pass
+the repository to review explicitly. Review scheduling and reciprocal-review
+policies belong in the calling assistant's or consumer project's instructions.
+
+From a source checkout, set `review_repo` to the repository you want reviewed:
 
 ```bash
 make check REVIEW_REPO="$review_repo"
@@ -95,28 +102,6 @@ For manually prepared design/evidence packets, `make check REVIEW_PROMPT=...`
 and `make review REVIEW_PROMPT=...` retain tool-free packet mode.
 See the [runner documentation](plugins/claude-adversarial-review/README.md).
 
-## Review Claude Code's work with Codex
-
-OpenAI's official plugin provides `/codex:adversarial-review`. The optional
-[`/codex-review` command](integrations/claude-code/commands/codex-review.md)
-also documents a direct Codex fallback for Claude's enclosing sandbox.
-Installing this Codex plugin does not activate that Claude Code command.
-
-To install the optional command, set `consumer_project` to your target project
-and run from this repository:
-
-```bash
-mkdir -p "$consumer_project/.claude/commands"
-cp -i integrations/claude-code/commands/codex-review.md \
-  "$consumer_project/.claude/commands/codex-review.md"
-```
-
-For Claude's Bash sandbox, merge `codex` into `sandbox.excludedCommands` in the
-target project's local settings and reload the sandbox. Start the fallback
-invocation with literal `codex`; a Node or shell wrapper can prevent exclusion
-matching. Keep Codex's own read-only sandbox. The command documents diagnostics
-when an enclosing environment still blocks access.
-
 ## Scope and limits
 
 - Snapshots omit ignored files, symlinks, binary content, common private paths,
@@ -133,9 +118,6 @@ when an enclosing environment still blocks access.
 - Claude cannot edit code, execute shell commands, delegate, or use a browser
   through the granted tools. User/repository customizations and MCP are disabled;
   managed policy, including managed hooks, remains in effect.
-- The optional Codex fallback permits broader filesystem reads under Codex's
-  read-only sandbox. Its workflow requires snapshot-only inspection and checking
-  command logs; see the fallback command for the boundary details.
 - A completed request is not approval. Failed, malformed, timed-out, or
   insufficient-context reviews are reported separately. Validate findings before
   applying fixes; source inspection does not replace tests or browser checks.

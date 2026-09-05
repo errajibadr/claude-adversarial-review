@@ -1,8 +1,10 @@
 # Contributor instructions
 
-This repository distributes a dependency-free Codex plugin and an optional
-Claude Code command. Keep the installed plugin self-contained: resolve resources
-relative to its skill, never from the repository being reviewed.
+This repository supplies independent adversarial reviews performed by Claude.
+It distributes a dependency-free runner for coding assistants and Codex plugin
+packaging. Keep resources self-contained: resolve them relative to the installed
+skill or runner, never from the repository being reviewed. Host-specific
+reciprocal review policies belong in host or consumer-project instructions.
 
 - Review workers must not dispatch other reviewers, edit code, or install tools.
 - Preserve tool/MCP/customization restrictions and truthful failure reporting.
