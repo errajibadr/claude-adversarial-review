@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.ruff_cache/
+.pytest_cache/
+.DS_Store
+.env
+.env.*
+*.local.json
+review-artifacts/

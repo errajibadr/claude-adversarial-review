@@ -1,0 +1,26 @@
+{
+  "name": "claude-adversarial-review",
+  "version": "0.1.0",
+  "description": "Independent Claude reviews of code and design, driven by an inspected evidence packet.",
+  "author": {
+    "name": "errajibadr"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Claude Adversarial Review",
+    "shortDescription": "Independent Claude reviews of code and design.",
+    "longDescription": "Review scoped evidence for security, performance, correctness, frontend, accessibility, and architecture risks through the installed Claude Code CLI.",
+    "developerName": "errajibadr",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Review my changes with Claude, focusing on security, performance, and correctness."
+  },
+  "homepage": "https://github.com/errajibadr/claude-adversarial-review",
+  "repository": "https://github.com/errajibadr/claude-adversarial-review",
+  "keywords": [
+    "codex",
+    "claude",
+    "adversarial-review",
+    "code-review"
+  ]
+}
