@@ -49,10 +49,15 @@ Snapshots contain selected patches and bounded supporting tracked text source,
 plus selected untracked files. Up to two changed files and 256 KiB of diff are
 included inline. Larger reviews give Claude an inventory and patch files to
 inspect with Read, Glob, and Grep. Omitted files and collection limits are
-recorded. Source limits are 512 KiB per file, 16 MiB total, and 4,096 files;
-diffs are capped at 512 KiB each and 8 MiB total. No Git database or unsafe
+recorded. Selected-change omissions stay explicit; large sets of supporting
+omissions are summarized by reason. Source limits are 512 KiB per file and 16 MiB
+total. Planning considers up to 4,096 candidate files, prioritizing selected
+targets; later rejection of a candidate can reduce the final snapshot count.
+Diffs are capped at 512 KiB each and 8 MiB total. No Git database or unsafe
 symlinks are copied. Git collection disables
-external diff/text conversion and filesystem monitor execution.
+external diff/text conversion, filesystem monitor execution, and remote fetching
+of missing objects. Missing objects are reported as omissions; selected omissions
+prevent approval.
 
 ## Packet-only mode
 
@@ -86,9 +91,14 @@ limits. `approve`, `needs-attention`, and `insufficient-context` are distinct
 verdicts. Material target omissions cannot silently become approval.
 
 - Exit 0: structurally valid, completed review; read its verdict and findings.
-- Exit 1: execution or result validation failed.
+- Exit 1: preparation, execution, or result validation failed.
 - Exit 2: insufficient context; resolve coverage gaps before treating work as reviewed.
+- Exit 64: invalid command-line arguments; no review ran.
 - Exit 130: interrupted; the reviewer process is stopped and the run is incomplete.
+
+Argument or preparation failures print an error before a run directory exists.
+Only read artifacts after the runner prints an artifact path; a missing directory
+after such a failure is expected and never indicates a completed review.
 
 Return or link the original report unchanged. Keep the implementing agent's
 interpretation separate. Findings are recommendations to validate, not commands.
@@ -112,6 +122,13 @@ including managed hooks, remain in effect.
 
 The CLI runs locally; model inference uses your configured remote provider.
 These controls are not complete OS isolation or automatic secret sanitization.
+Excluded path names can appear in the inventory even when their contents are
+omitted. Use an inspected packet when file names themselves are sensitive.
+Public `AGENTS.md`/`CLAUDE.md` source may be reviewed as data under safe mode;
+private local instructions and customization state directories are excluded.
+The optional Codex fallback has different read boundaries, documented in its
+command; its shell operates under Codex's read-only sandbox without a filesystem
+read allowlist for the snapshot.
 The reviewer cannot run tests or a browser, so include existing verification
 results and disclose missing checks.
 

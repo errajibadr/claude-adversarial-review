@@ -99,11 +99,13 @@ Keep all runner flags; never copy credentials or disable TLS verification.
 
 ## 4. Return the original report
 
-Read exit status, `metadata.json`, `review.json`, and `review.md`. Require both a
-successful CLI envelope and valid structured findings. Execution success and
+Read the exit status first. Preparation failures (exit 1) and argument errors
+(exit 64) may occur before any artifact directory exists. When an artifact path
+is printed, inspect `metadata.json` and any returned `review.json`/`review.md`.
+Require both a successful CLI envelope and valid structured findings. Execution success and
 review verdict are separate: findings are not approval. Exit 1 means failure;
-exit 2 means insufficient context. A failed, canceled, or partial review is not
-a pass.
+exit 2 means a completed review with insufficient context; exit 64 means invalid
+arguments. A failed, canceled, or partial review is not a pass.
 
 Return the rendered review unchanged or link its complete original; do not
 silently paraphrase away findings. Separately report requested/actual model,

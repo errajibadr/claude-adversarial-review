@@ -4,19 +4,21 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import os
 import re
+import secrets
 import signal
 import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from types import FrameType
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol, cast
 
 MAX_PROMPT_BYTES = 512 * 1024
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -73,22 +75,108 @@ def read_packet(path: Path) -> bytes:
     return packet
 
 
+class ReviewArgumentParser(argparse.ArgumentParser):
+    """Reserve exit 64 for invalid usage, distinct from completed review outcomes."""
+
+    def error(self, message: str) -> NoReturn:
+        """Print ordinary argparse diagnostics with a dedicated usage status."""
+        self.print_usage(sys.stderr)
+        self.exit(64, f"{self.prog}: error: {message}\n")
+
+
+def compact_scope(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Keep repository-sized inventories outside the model's initial prompt."""
+    if metadata.get("mode") == "packet-only":
+        return {"mode": "packet-only", "input_bytes": metadata.get("input_bytes")}
+    keys = (
+        "scope",
+        "requested_scope",
+        "head_commit",
+        "base_ref",
+        "base_commit",
+        "merge_base",
+        "source_revision",
+        "selected_count",
+        "source_file_count",
+        "source_bytes",
+        "diff_bytes",
+        "coverage_complete",
+        "supporting_context_complete",
+        "worktree_dirty",
+        "input_mode",
+        "changed_targets_outside_path_filters",
+    )
+    summary = {key: metadata[key] for key in keys if key in metadata}
+    counts = metadata.get("omission_counts")
+    if isinstance(counts, dict):
+        summary["omission_counts"] = {key: counts[key] for key in ("total", "selected", "supporting") if key in counts}
+    else:
+        omissions = metadata.get("omissions", [])
+        selected = sum(isinstance(item, dict) and item.get("selected_target") is True for item in omissions)
+        summary["omission_counts"] = {"total": len(omissions), "selected": selected, "supporting": len(omissions) - selected}
+    summary["inventory"] = "Read inventory.json for source paths, selected omissions, and supporting omission summaries."
+    return summary
+
+
+def collect_repository_context(
+    repo: Path,
+    *,
+    scope: str,
+    base: str | None,
+    paths: list[str] | None,
+    excludes: list[str] | None,
+) -> ReviewContext:
+    """Load the installed sibling by path, independent of Python search-path settings."""
+    module_path = PLUGIN_ROOT / "scripts" / "review_context.py"
+    if not module_path.is_file():
+        raise ValueError("Installed plugin is incomplete: scripts/review_context.py is missing. Reinstall the complete plugin, not review.py alone.")
+    module_name = "_claude_adversarial_review_context"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ValueError("Could not load the installed context collector; reinstall the complete plugin.")
+    module = importlib.util.module_from_spec(spec)
+    previous_module = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    previous_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    except (ImportError, OSError, SyntaxError) as exc:
+        if previous_module is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous_module
+        raise ValueError("Could not load the installed context collector; reinstall the complete plugin.") from exc
+    finally:
+        sys.dont_write_bytecode = previous_bytecode
+    collector = getattr(module, "collect_context", None)
+    if not callable(collector):
+        raise ValueError("Installed context collector is incompatible; reinstall the complete plugin.")
+    return cast(ReviewContext, collector(repo, scope=scope, base=base, paths=paths, excludes=excludes))
+
+
 def compose_prompt(evidence: str, focus: str, metadata: dict[str, Any], target: str) -> bytes:
-    """Combine the installed review instructions with explicitly scoped evidence."""
+    """Combine scoped evidence with distinct, unpredictable boundary markers."""
     template = (PLUGIN_ROOT / "prompts" / "adversarial-review.md").read_text(encoding="utf-8")
     values = {
         "TARGET": target,
-        "FOCUS": focus,
-        "SCOPE": json.dumps(metadata, ensure_ascii=False),
+        "FOCUS": focus if focus.strip() else DEFAULT_FOCUS,
+        "SCOPE": json.dumps(compact_scope(metadata), ensure_ascii=False),
         "EVIDENCE": evidence,
     }
+    while True:
+        token = secrets.token_hex(16)
+        opening, closing = f"<review-evidence-{token}>", f"</review-evidence-{token}>"
+        if not any(opening in value or closing in value for value in (*values.values(), template)):
+            break
+    values.update(EVIDENCE_OPEN=opening, EVIDENCE_CLOSE=closing)
     prompt = re.sub(
-        r"\{\{(TARGET|FOCUS|SCOPE|EVIDENCE)\}\}",
+        r"\{\{(TARGET|FOCUS|SCOPE|EVIDENCE|EVIDENCE_OPEN|EVIDENCE_CLOSE)\}\}",
         lambda match: values[match.group(1)],
         template,
     ).encode("utf-8")
     if len(prompt) > MAX_PROMPT_BYTES:
-        raise ValueError("Composed prompt exceeds 512 KiB; narrow the paths or reduce the prompt packet.")
+        raise ValueError("Composed prompt exceeds 512 KiB; reduce the selected inline evidence, focus text, or explicit prompt packet.")
     return prompt
 
 
@@ -260,7 +348,10 @@ def check_cli(cwd: Path) -> str | None:
     )
     missing = [flag for flag in required if flag not in help_text]
     if result.returncode != 0 or missing:
-        return f"Claude CLI lacks required review capabilities ({', '.join(missing) or 'help failed'}). Install Claude Code 2.1.248 or newer; confinement is never disabled as a fallback."
+        return (
+            f"Claude CLI lacks required review capabilities ({', '.join(missing) or 'help failed'}). "
+            "Install Claude Code 2.1.248 or newer; confinement is never disabled as a fallback."
+        )
     return None
 
 
@@ -298,10 +389,13 @@ def run_review(
     context: ReviewContext | None = None,
 ) -> tuple[Path, int]:
     """Retain private artifacts and distinguish execution failure from review findings."""
+    argv = command(model, repository=context is not None)
+    cli_error = check_cli(PLUGIN_ROOT)
+    if cli_error:
+        raise ValueError(cli_error)
     output = Path(tempfile.mkdtemp(prefix="claude-adversarial-review-", dir=output_parent))
     snapshot = output / "context"
     snapshot.mkdir(mode=0o700)
-    argv = command(model, repository=context is not None)
     context_metadata = context.metadata if context else {"mode": "packet-only"}
     metadata: dict[str, Any] = {
         "status": "preparing",
@@ -316,7 +410,7 @@ def run_review(
         "context": context_metadata,
         "review_verdict": None,
         "effective_verdict": None,
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": datetime.now(UTC).isoformat(),
     }
 
     def save_metadata() -> None:
@@ -334,7 +428,6 @@ def run_review(
     try:
         if context:
             context.write_snapshot(snapshot)
-        error = check_cli(snapshot)
         if error is None:
             metadata.update(status="running", execution_status="running")
             save_metadata()
@@ -395,7 +488,10 @@ def run_review(
         )
         markdown = format_review(review)
         if host_incomplete:
-            markdown += "\n## Host coverage limitation\n\nSelected change evidence is incomplete or empty in the snapshot. The effective outcome is insufficient-context. See metadata.json for the exact omissions.\n"
+            markdown += (
+                "\n## Host coverage limitation\n\nSelected change evidence is incomplete or empty in the snapshot. "
+                "The effective outcome is insufficient-context. See metadata.json for the exact omissions.\n"
+            )
         status, execution_status, exit_code = (
             "insufficient-context" if incomplete else "success",
             "succeeded",
@@ -409,7 +505,7 @@ def run_review(
         error=error,
         actual_models=sorted(model_usage) if isinstance(model_usage, dict) else [],
         duration_seconds=round(time.monotonic() - start, 3),
-        finished_at=datetime.now(timezone.utc).isoformat(),
+        finished_at=datetime.now(UTC).isoformat(),
         exit_code=exit_code,
     )
     save_metadata()
@@ -418,7 +514,7 @@ def run_review(
 
 def main(argv: list[str] | None = None) -> int:
     """Prepare a scope-aware review or validate its inventory without model calls."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = ReviewArgumentParser(description=__doc__)
     parser.add_argument(
         "--prompt-file",
         type=Path,
@@ -470,10 +566,7 @@ def main(argv: list[str] | None = None) -> int:
             }
             target = "Explicit prompt packet; source file tools are unavailable."
         else:
-            sys.dont_write_bytecode = True
-            from review_context import collect_context
-
-            context = collect_context(
+            context = collect_repository_context(
                 args.repo or Path.cwd(),
                 scope=args.scope or "auto",
                 base=args.base,
@@ -485,7 +578,12 @@ def main(argv: list[str] | None = None) -> int:
         packet = compose_prompt(evidence, args.focus, metadata, target)
         argv_preview = command(args.model, repository=context is not None)
     except (OSError, ValueError) as exc:
-        parser.error(str(exc) if isinstance(exc, ValueError) else "Could not read the input, installed plugin resources, or output parent.")
+        detail = str(exc) if isinstance(exc, ValueError) else "Could not read the input, installed plugin resources, or output parent."
+        print(f"Review preflight failed: {detail} No review artifacts were created.", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("Review interrupted before execution. No review artifacts were created.", file=sys.stderr)
+        return 130
     if args.dry_run:
         print(
             json.dumps(
@@ -501,9 +599,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         output, exit_code = run_review(packet, args.model, args.timeout, args.output_dir, context=context)
-    except OSError:
-        print("Could not create or write private review artifacts.", file=sys.stderr)
+    except ValueError as exc:
+        print(f"Review failed: {exc} If an artifact path was printed, inspect that directory.", file=sys.stderr)
         return 1
+    except OSError:
+        print(
+            "Could not create or write private review artifacts. If an artifact path was printed, partial artifacts may remain there.",
+            file=sys.stderr,
+        )
+        return 1
+    except KeyboardInterrupt:
+        print("Review interrupted. If an artifact path was printed, partial artifacts may remain there.", file=sys.stderr)
+        return 130
     final = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
     print(f"Review execution: {final['execution_status']}; outcome: {final['effective_verdict'] or final['status']}. Artifacts: {output}")
     return exit_code

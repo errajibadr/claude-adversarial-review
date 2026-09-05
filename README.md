@@ -23,6 +23,17 @@ codex plugin marketplace add https://github.com/errajibadr/claude-adversarial-re
 codex plugin add claude-adversarial-review@claude-adversarial-review
 ```
 
+To pick up a published update, refresh this marketplace and explicitly reinstall:
+
+```bash
+codex plugin marketplace upgrade claude-adversarial-review
+codex plugin add claude-adversarial-review@claude-adversarial-review
+```
+
+Marketplace refresh alone does not update the installed plugin. If you also
+have the older `personal` variant installed, remove that variant after verifying
+the Git installation when you want to replace it.
+
 Start a fresh Codex task after installation. Prerequisites: Python 3.12+, Git,
 and an authenticated Claude Code CLI supporting `--safe-mode` and `--restricted`
 (restricted requires 2.1.248+). There are no Python package dependencies.
@@ -111,6 +122,8 @@ when an enclosing environment still blocks access.
 - Snapshots omit ignored files, symlinks, binary content, common private paths,
   and files exceeding collection limits. Omissions are recorded; an omitted
   selected change cannot silently receive approval.
+- Omitted contents may still have their path names listed in the inventory.
+  Use packet mode when those names are themselves sensitive.
 - Filename filters are not secret detection. Inspect the scope and evidence;
   exclude credentials, private client data, and unrelated work before sending.
 - Source snapshots allow supporting tracked source beyond the changed paths.
@@ -120,6 +133,9 @@ when an enclosing environment still blocks access.
 - Claude cannot edit code, execute shell commands, delegate, or use a browser
   through the granted tools. User/repository customizations and MCP are disabled;
   managed policy, including managed hooks, remains in effect.
+- The optional Codex fallback permits broader filesystem reads under Codex's
+  read-only sandbox. Its workflow requires snapshot-only inspection and checking
+  command logs; see the fallback command for the boundary details.
 - A completed request is not approval. Failed, malformed, timed-out, or
   insufficient-context reviews are reported separately. Validate findings before
   applying fixes; source inspection does not replace tests or browser checks.
