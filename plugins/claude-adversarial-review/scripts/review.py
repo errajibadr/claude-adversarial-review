@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run an independent Claude review using a private source snapshot or prompt packet."""
+"""Run an independent Claude review of live Git changes, an explicit snapshot, or a prompt packet."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from types import FrameType
+from types import FrameType, ModuleType
 from typing import Any, NoReturn, Protocol, cast
 
 MAX_PROMPT_BYTES = 512 * 1024
@@ -28,13 +28,17 @@ DEFAULT_FOCUS = (
 
 
 class ReviewContext(Protocol):
-    """A bounded, inspected collection of source and change evidence."""
+    """Resolved review scope and mode-specific change evidence."""
 
     prompt: str
     metadata: dict[str, Any]
 
     def write_snapshot(self, destination: Path) -> None:
         """Write the previously collected evidence into a private directory."""
+        ...
+
+    def recheck(self) -> dict[str, Any]:
+        """Check whether selected live evidence still matches its captured fingerprint."""
         ...
 
 
@@ -89,6 +93,9 @@ def compact_scope(metadata: dict[str, Any]) -> dict[str, Any]:
     if metadata.get("mode") == "packet-only":
         return {"mode": "packet-only", "input_bytes": metadata.get("input_bytes")}
     keys = (
+        "context_mode",
+        "repo_root",
+        "git_commands",
         "scope",
         "requested_scope",
         "head_commit",
@@ -105,8 +112,16 @@ def compact_scope(metadata: dict[str, Any]) -> dict[str, Any]:
         "worktree_dirty",
         "input_mode",
         "changed_targets_outside_path_filters",
+        "excluded_change_count",
+        "exclusions_are_access_boundary",
     )
     summary = {key: metadata[key] for key in keys if key in metadata}
+    if metadata.get("context_mode") == "live":
+        excluded_counts: dict[str, int] = {}
+        for change in metadata.get("excluded_changes", []):
+            reason = change["reason"]
+            excluded_counts[reason] = excluded_counts.get(reason, 0) + 1
+        summary["excluded_change_reasons"] = excluded_counts
     counts = metadata.get("omission_counts")
     if isinstance(counts, dict):
         summary["omission_counts"] = {key: counts[key] for key in ("total", "selected", "supporting") if key in counts}
@@ -114,26 +129,23 @@ def compact_scope(metadata: dict[str, Any]) -> dict[str, Any]:
         omissions = metadata.get("omissions", [])
         selected = sum(isinstance(item, dict) and item.get("selected_target") is True for item in omissions)
         summary["omission_counts"] = {"total": len(omissions), "selected": selected, "supporting": len(omissions) - selected}
-    summary["inventory"] = "Read inventory.json for source paths, selected omissions, and supporting omission summaries."
+    if metadata.get("context_mode") != "live":
+        summary["inventory"] = "Read inventory.json for source paths, selected omissions, and supporting omission summaries."
     return summary
 
 
-def collect_repository_context(
-    repo: Path,
-    *,
-    scope: str,
-    base: str | None,
-    paths: list[str] | None,
-    excludes: list[str] | None,
-) -> ReviewContext:
-    """Load the installed sibling by path, independent of Python search-path settings."""
-    module_path = PLUGIN_ROOT / "scripts" / "review_context.py"
+def installed_module(name: str) -> ModuleType:
+    """Load trusted installed siblings without consulting the target repository or Python search path."""
+    module_path = PLUGIN_ROOT / "scripts" / f"{name}.py"
     if not module_path.is_file():
-        raise ValueError("Installed plugin is incomplete: scripts/review_context.py is missing. Reinstall the complete plugin, not review.py alone.")
-    module_name = "_claude_adversarial_review_context"
+        raise ValueError(f"Installed plugin is incomplete: scripts/{name}.py is missing. Reinstall the complete plugin, not review.py alone.")
+    module_name = f"_claude_adversarial_{name}"
+    cached = sys.modules.get(module_name)
+    if cached is not None and getattr(cached, "__file__", None) == str(module_path):
+        return cached
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     if spec is None or spec.loader is None:
-        raise ValueError("Could not load the installed context collector; reinstall the complete plugin.")
+        raise ValueError(f"Could not load installed scripts/{name}.py; reinstall the complete plugin.")
     module = importlib.util.module_from_spec(spec)
     previous_module = sys.modules.get(module_name)
     sys.modules[module_name] = module
@@ -146,13 +158,33 @@ def collect_repository_context(
             sys.modules.pop(module_name, None)
         else:
             sys.modules[module_name] = previous_module
-        raise ValueError("Could not load the installed context collector; reinstall the complete plugin.") from exc
+        raise ValueError(f"Could not load installed scripts/{name}.py; reinstall the complete plugin.") from exc
     finally:
         sys.dont_write_bytecode = previous_bytecode
-    collector = getattr(module, "collect_context", None)
+    return module
+
+
+def collect_repository_context(
+    repo: Path,
+    *,
+    scope: str,
+    base: str | None,
+    paths: list[str] | None,
+    excludes: list[str] | None,
+    context_mode: str = "live",
+) -> ReviewContext:
+    """Resolve repository evidence using the collector distributed alongside this runner."""
+    collector = getattr(installed_module("review_context"), "collect_context", None)
     if not callable(collector):
         raise ValueError("Installed context collector is incompatible; reinstall the complete plugin.")
-    return cast(ReviewContext, collector(repo, scope=scope, base=base, paths=paths, excludes=excludes))
+    context = cast(ReviewContext, collector(repo, scope=scope, base=base, paths=paths, excludes=excludes, context_mode=context_mode))
+    if context.metadata.get("context_mode") == "live":
+        runtime = installed_module("claude_runtime")
+        try:
+            context.metadata["git_commands"] = runtime.live_git_commands(Path(context.metadata["repo_root"]), **live_scope(context.metadata))
+        except runtime.RuntimeFailure as exc:
+            raise ValueError(str(exc)) from exc
+    return context
 
 
 def compose_prompt(evidence: str, focus: str, metadata: dict[str, Any], target: str) -> bytes:
@@ -180,9 +212,34 @@ def compose_prompt(evidence: str, focus: str, metadata: dict[str, Any], target: 
     return prompt
 
 
-def command(model: str, *, repository: bool = False) -> list[str]:
-    """Confine source inspection to a snapshot and disable executable tools."""
+def live_scope(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Pass the captured comparison to policy and canonical command generation."""
+    return {key: metadata.get(key) for key in ("scope", "head_commit", "merge_base")}
+
+
+def live_policy(context: ReviewContext) -> dict[str, Any]:
+    """Build the required live-tool restrictions using captured Git directory locations."""
+    metadata = context.metadata
+    runtime = installed_module("claude_runtime")
+    try:
+        return cast(
+            dict[str, Any],
+            runtime.build_live_policy(
+                Path(metadata["repo_root"]),
+                [Path(metadata["git_dir"]), Path(metadata["git_common_dir"])],
+                **live_scope(metadata),
+            ),
+        )
+    except runtime.RuntimeFailure as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def command(model: str, *, repository: bool = False, context: ReviewContext | None = None) -> list[str]:
+    """Select live sandboxed inspection, explicit snapshot reads, or tool-free packet review."""
     schema = json.loads((PLUGIN_ROOT / "schemas" / "review-output.schema.json").read_text(encoding="utf-8"))
+    if context is not None and context.metadata.get("context_mode") == "live":
+        argv = installed_module("claude_runtime").live_cli_arguments(live_policy(context), Path(context.metadata["repo_root"]))
+        return [*argv, "--model", model, "--json-schema", json.dumps(schema)]
     argv = [
         "claude",
         "--safe-mode",
@@ -323,7 +380,7 @@ def format_review(review: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def check_cli(cwd: Path) -> str | None:
+def check_cli(cwd: Path, *, live: bool = False) -> str | None:
     """Fail closed if the installed CLI lacks the required confinement flags."""
     try:
         result = subprocess.run(
@@ -346,11 +403,13 @@ def check_cli(cwd: Path) -> str | None:
         "--strict-mcp-config",
         "--no-session-persistence",
     )
+    if live:
+        required += ("--input-format", "--output-format", "--settings", "--add-dir", "--permission-mode")
     missing = [flag for flag in required if flag not in help_text]
     if result.returncode != 0 or missing:
         return (
             f"Claude CLI lacks required review capabilities ({', '.join(missing) or 'help failed'}). "
-            "Install Claude Code 2.1.248 or newer; confinement is never disabled as a fallback."
+            "Update Claude Code and retry; capabilities are checked at runtime and confinement is never disabled as a fallback."
         )
     return None
 
@@ -389,13 +448,15 @@ def run_review(
     context: ReviewContext | None = None,
 ) -> tuple[Path, int]:
     """Retain private artifacts and distinguish execution failure from review findings."""
-    argv = command(model, repository=context is not None)
-    cli_error = check_cli(PLUGIN_ROOT)
+    is_live = context is not None and context.metadata.get("context_mode") == "live"
+    argv = command(model, repository=context is not None, context=context)
+    cli_error = check_cli(PLUGIN_ROOT, live=is_live)
     if cli_error:
         raise ValueError(cli_error)
     output = Path(tempfile.mkdtemp(prefix="claude-adversarial-review-", dir=output_parent))
     snapshot = output / "context"
-    snapshot.mkdir(mode=0o700)
+    if not is_live:
+        snapshot.mkdir(mode=0o700)
     context_metadata = context.metadata if context else {"mode": "packet-only"}
     metadata: dict[str, Any] = {
         "status": "preparing",
@@ -426,9 +487,40 @@ def run_review(
     process: subprocess.Popen[bytes] | None = None
     previous_handler = signal.signal(signal.SIGTERM, _interrupt)
     try:
-        if context:
+        if context and not is_live:
             context.write_snapshot(snapshot)
-        if error is None:
+        if is_live and context is not None:
+            metadata.update(status="running", execution_status="running")
+            save_metadata()
+
+            def record_pid(pid: int) -> None:
+                metadata["pid"] = pid
+                save_metadata()
+
+            with tempfile.TemporaryDirectory(prefix="claude-review-launcher-") as launcher_name:
+                result = installed_module("claude_runtime").run_live(
+                    argv,
+                    packet,
+                    Path(launcher_name),
+                    live_policy(context),
+                    timeout,
+                    output / "events.jsonl",
+                    output / "stderr.log",
+                    on_started=record_pid,
+                )
+            metadata["returncode"] = result.returncode
+            metadata["policy_verification"] = result.policy_summary
+            interrupted = result.interrupted
+            raw = json.dumps(result.payload, ensure_ascii=False).encode("utf-8") if result.payload else b""
+            payload, response_error = assess_response(raw, result.returncode if result.returncode is not None else 1)
+            error = result.error or response_error
+            if error is None:
+                try:
+                    stability = context.recheck()
+                except (OSError, ValueError):
+                    stability = {"unchanged": False, "reason": "Selected evidence could not be rechecked after review."}
+                metadata["scope_stability"] = stability
+        else:
             metadata.update(status="running", execution_status="running")
             save_metadata()
             process = subprocess.Popen(
@@ -457,7 +549,7 @@ def run_review(
         interrupted = True
         error = "Claude review was interrupted."
     except OSError:
-        error = "Claude or its private snapshot could not be prepared; verify CLI availability and filesystem permissions."
+        error = "Claude or its private runtime could not be prepared; verify CLI availability and filesystem permissions."
     except ValueError as exc:
         error = str(exc)
     finally:
@@ -466,7 +558,8 @@ def run_review(
             metadata["returncode"] = process.returncode
         signal.signal(signal.SIGTERM, previous_handler)
     (output / "response.json").write_bytes(raw)
-    (output / "stderr.log").write_bytes(stderr)
+    if not is_live or not (output / "stderr.log").exists():
+        (output / "stderr.log").write_bytes(stderr)
     review = payload.get("structured_output")
     if isinstance(review, dict):
         (output / "review.json").write_text(json.dumps(review, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -481,6 +574,8 @@ def run_review(
         review = payload["structured_output"]
         verdict = review["verdict"]
         host_incomplete = context_metadata.get("coverage_complete") is False or context_metadata.get("changes") == []
+        stale = is_live and metadata.get("scope_stability", {}).get("unchanged") is not True
+        host_incomplete = host_incomplete or stale
         incomplete = verdict == "insufficient-context" or host_incomplete
         metadata.update(
             review_verdict=verdict,
@@ -489,8 +584,13 @@ def run_review(
         markdown = format_review(review)
         if host_incomplete:
             markdown += (
-                "\n## Host coverage limitation\n\nSelected change evidence is incomplete or empty in the snapshot. "
-                "The effective outcome is insufficient-context. See metadata.json for the exact omissions.\n"
+                "\n## Host coverage limitation\n\n"
+                + (
+                    "The selected scope changed during review or could not be verified again. "
+                    if stale
+                    else "Selected change evidence is incomplete or empty. "
+                )
+                + "The effective outcome is insufficient-context. See metadata.json for details.\n"
             )
         status, execution_status, exit_code = (
             "insufficient-context" if incomplete else "success",
@@ -522,6 +622,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--repo", type=Path, help="Repository to review (default: current directory).")
     parser.add_argument(
+        "--context-mode",
+        choices=("live", "snapshot"),
+        help="Repository evidence access: live files and Git (default), or an explicit bounded source snapshot.",
+    )
+    parser.add_argument(
         "--scope",
         choices=("auto", "working-tree", "branch"),
         help="Change scope (default: auto).",
@@ -532,7 +637,13 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         help="Changed target path filter; repeat to select multiple paths.",
     )
-    parser.add_argument("--exclude", action="append", help="Additional excluded glob; repeat as needed.")
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        help=(
+            "Excluded scope glob; repeat as needed. Live exclusions do not restrict file or Git access; snapshot exclusions also omit source copies."
+        ),
+    )
     parser.add_argument("--focus", default=DEFAULT_FOCUS, help="Review focus or selected lenses.")
     parser.add_argument("--model", type=model_name, default="opus")
     parser.add_argument(
@@ -552,8 +663,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Show scope, inventory, exclusions and flags without file bodies, model calls, or artifact writes.",
     )
     args = parser.parse_args(argv)
-    if args.prompt_file and any(value is not None for value in (args.repo, args.scope, args.base, args.path, args.exclude)):
-        parser.error("--prompt-file cannot be combined with --repo, --scope, --base, --path, or --exclude.")
+    if args.prompt_file and any(value is not None for value in (args.repo, args.scope, args.base, args.path, args.exclude, args.context_mode)):
+        parser.error("--prompt-file cannot be combined with --repo, --scope, --base, --path, --exclude, or --context-mode.")
     context: ReviewContext | None = None
     try:
         if args.output_dir is not None and not args.output_dir.is_dir():
@@ -572,11 +683,16 @@ def main(argv: list[str] | None = None) -> int:
                 base=args.base,
                 paths=args.path,
                 excludes=args.exclude,
+                context_mode=args.context_mode or "live",
             )
             evidence, metadata = context.prompt, context.metadata
-            target = "Repository change evidence in the private context snapshot."
+            target = (
+                "Live repository files and captured Git changes; exclusions define scope, not an access boundary."
+                if args.context_mode != "snapshot"
+                else "Repository change evidence in the private context snapshot."
+            )
         packet = compose_prompt(evidence, args.focus, metadata, target)
-        argv_preview = command(args.model, repository=context is not None)
+        argv_preview = command(args.model, repository=context is not None, context=context)
     except (OSError, ValueError) as exc:
         detail = str(exc) if isinstance(exc, ValueError) else "Could not read the input, installed plugin resources, or output parent."
         print(f"Review preflight failed: {detail} No review artifacts were created.", file=sys.stderr)

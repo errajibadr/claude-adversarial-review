@@ -2,13 +2,31 @@
 
 Independent Claude review for Codex and other coding assistants, with security,
 performance, code correctness, frontend, accessibility, architecture, and other
-review lenses. The repository provides a Codex plugin and a standalone Python
+review lenses. This repository provides a Codex plugin and a standalone Python
 runner that other assistants can invoke directly.
 
-The reviewer can inspect a prepared source snapshot with read tools. The runner
-selects Git changes and validates structured findings before reporting a verdict.
-It uses your installed, authenticated Claude Code CLI; inference runs through
-your configured remote Anthropic or provider service.
+By default, Claude inspects the actual repository with read tools and restricted
+read-only Git commands. Small diffs are included in its prompt; larger reviews
+start from a scope inventory and let Claude collect the evidence it needs.
+The runner validates structured findings and reports incomplete reviews honestly.
+It uses your installed, authenticated Claude Code CLI. The CLI runs locally;
+model inference uses your configured Anthropic or provider service.
+
+```text
+Coding assistant selects scope and focus
+                  |
+                  v
+Runner captures target revisions and inventory
+                  |
+                  v
+Claude reads source + inspects read-only Git diffs
+                  |
+                  v
+Runner validates findings + checks live scope is unchanged
+                  |
+                  v
+Original report and effective outcome return to the assistant
+```
 
 ## Install in Codex
 
@@ -34,12 +52,24 @@ codex plugin add claude-adversarial-review@claude-adversarial-review
 
 Marketplace refresh alone does not update the installed plugin. If you also
 have the older `personal` variant installed, remove that variant after verifying
-the Git installation when you want to replace it.
+the Git installation when you want to replace it. Start a fresh Codex task after
+installation.
 
-Start a fresh Codex task after installation. Prerequisites: Python 3.12+, Git,
-and an authenticated Claude Code CLI supporting `--safe-mode` and `--restricted`
-(restricted requires 2.1.248+). There are no Python package dependencies.
-Check `claude --version` and `claude auth status`.
+Prerequisites: Python 3.12+, Git, and authenticated Claude Code. The live protocol
+was tested with Claude Code 2.1.261. The runner checks the CLI's reported effective
+configuration and provenance before sending the prompt; Claude's native sandbox
+and `failIfUnavailable` provide enforcement. This assumes a trusted, functioning
+CLI, not a stable protocol across versions or proof against a broken or malicious
+binary. Snapshot and packet modes also require the supported safe/restricted
+controls. Check `claude --version` and `claude auth status`. No Python package
+dependencies are required.
+
+Repository modes reject configured Git clean/process filter commands before
+collecting diffs, including unused global filter definitions: ordinary Git diff
+can execute them. An index/configuration preflight also checks reachable
+initialized submodules recursively, without reading or copying source bodies.
+Unchecked or unsafe nested configuration blocks repository collection. Use an
+explicitly prepared `--prompt-file` instead; the runner does not switch modes automatically.
 
 ## Ask for a review
 
@@ -49,7 +79,7 @@ Check `claude --version` and `claude auth status`.
 > Review this branch against main. Challenge the checkout design and check
 > frontend behavior, accessibility, and failure recovery.
 
-The calling assistant inspects the scope and exclusions, launches Claude, and returns its original
+The calling assistant inspects the scope, starts Claude, and returns the original
 report with coverage limits. `opus` is the default alias; another alias or full
 provider model ID can be explicitly requested. Results record the actual model.
 Your configured account's usage and billing apply.
@@ -62,16 +92,16 @@ This project follows the review-quality practices in OpenAI's
 | Practice | This plugin |
 | --- | --- |
 | Concrete review scope | Auto selects dirty working-tree changes; otherwise branch comparison. Explicit base and task paths are supported. |
-| Adaptive evidence | Small diffs inline; larger reviews use a source inventory and independently readable diff files. |
-| Independent inspection | Claude reads surrounding source in a prepared snapshot using Read, Glob, and Grep. |
+| Adaptive evidence | Up to two changed files and 256 KiB of diff inline; larger reviews start with an inventory and defer detailed collection. |
+| Independent inspection | In default live mode, Claude reads the actual repository and inspects diffs with restricted read-only Git commands. |
 | Structured findings | Validated verdict, summary, severity, location, confidence, recommendation, next steps, and coverage limits. |
 | Review only | The worker returns findings without applying fixes or invoking another reviewer. |
 | Tracked execution | The host tracks background jobs; the runner stores private artifacts and distinguishes failure from verdict. |
 
-There are deliberate runtime differences: OpenAI uses Codex's app server with
-read-only Git access in the checkout and its own job registry. This plugin uses
-Claude's CLI with a bounded source snapshot and host-managed jobs. It retains
-an explicit packet-only mode and a configurable timeout.
+OpenAI uses Codex's app server and its job registry. This plugin uses Claude's
+CLI and host-managed jobs. It also offers explicit snapshot and tool-free packet
+modes. Live-mode results include a check that the selected scope has not
+changed during the review.
 
 ## Use the runner directly
 
@@ -81,47 +111,73 @@ and invoke the runner directly. Resolve the runner from this package and pass
 the repository to review explicitly. Review scheduling and reciprocal-review
 policies belong in the calling assistant's or consumer project's instructions.
 
-From a source checkout, set `review_repo` to the repository you want reviewed:
-
-```bash
-make check REVIEW_REPO="$review_repo"
-make review REVIEW_REPO="$review_repo" REVIEW_MODEL=opus REVIEW_TIMEOUT=300
-```
-
-For exact scope selection:
+From a source checkout, set `review_repo` to the repository to review:
 
 ```bash
 python3 plugins/claude-adversarial-review/scripts/review.py \
-  --repo "$review_repo" --base main --path src --path tests \
-  --exclude 'private/**' --focus 'Challenge retry correctness and performance' \
+  --repo "$review_repo" --scope auto --focus 'Security and performance' \
   --dry-run < /dev/null
 ```
 
-Inspect the inventory and candidate evidence, then remove `--dry-run` to run.
-For manually prepared design/evidence packets, `make check REVIEW_PROMPT=...`
-and `make review REVIEW_PROMPT=...` retain tool-free packet mode.
-See the [runner documentation](plugins/claude-adversarial-review/README.md).
+Inspect the scope and candidate evidence, then run with the same options and
+without `--dry-run`. Live mode is the default; it can also be selected explicitly:
+
+```bash
+python3 plugins/claude-adversarial-review/scripts/review.py \
+  --repo "$review_repo" --context-mode live --base main \
+  --path src --path tests --focus 'Challenge retries and public API compatibility' \
+  --model opus --timeout 300 < /dev/null
+```
+
+To review a bounded copy instead of granting access to the actual repository:
+
+```bash
+python3 plugins/claude-adversarial-review/scripts/review.py \
+  --repo "$review_repo" --context-mode snapshot \
+  --exclude 'private/**' --focus 'Review the selected implementation' < /dev/null
+```
+
+For a manually prepared design or evidence packet, use `--prompt-file` alone.
+Packet mode grants no tools and cannot be combined with `--context-mode` or
+repository scope options. See the [runner documentation](plugins/claude-adversarial-review/README.md)
+for collection limits, result handling, and examples. The `make check` and
+`make review` shortcuts remain available from a source checkout.
 
 ## Scope and limits
 
-- Snapshots omit ignored files, symlinks, binary content, common private paths,
-  and files exceeding collection limits. Omissions are recorded; an omitted
-  selected change cannot silently receive approval.
-- Omitted contents may still have their path names listed in the inventory.
-  Use packet mode when those names are themselves sensitive.
-- Filename filters are not secret detection. Inspect the scope and evidence;
-  exclude credentials, private client data, and unrelated work before sending.
-- Source snapshots allow supporting tracked source beyond the changed paths.
-  Unrelated dirty supporting files use HEAD content when paths narrow the scope.
-  Use exclusions for sensitive supporting files. Packet-only mode sends only
-  the explicitly supplied packet (maximum 512 KiB).
-- Claude cannot edit code, execute shell commands, delegate, or use a browser
-  through the granted tools. User/repository customizations and MCP are disabled;
-  managed policy, including managed hooks, remains in effect.
-- A completed request is not approval. Failed, malformed, timed-out, or
-  insufficient-context reviews are reported separately. Validate findings before
-  applying fixes; source inspection does not replace tests or browser checks.
+- **Live mode gives access to the actual repository.** `--path`, `--exclude`,
+  ignore rules, and filename filters control selected review evidence; they
+  are not a privacy barrier against file reads. Use snapshot or an inspected
+  packet when the reviewer must not access other repository contents.
+- Live scope retains tracked changes even when Git ignore rules match them;
+  explicit exclusions and default private-path filters still apply. Live
+  working-tree reviews can inspect clean submodule pointer changes, while nested
+  uncommitted changes require separate review and produce insufficient context.
+- Snapshot mode copies bounded text evidence and grants Read, Glob, and Grep
+  without Git or Bash. It omits ignored files, symlinks, binary content, common
+  private paths, and over-limit files. Selected gitlink changes omit both source
+  and pointer evidence, so snapshot review of those changes is incomplete.
+  Relevant omissions are recorded.
+- Omitted contents may still have path names listed in the inventory. Filename
+  filters do not detect secrets. Use a curated packet when those names or
+  ordinary-looking source files contain sensitive material.
+- Live Git runs through Claude's native Bash sandbox, denying writes to the
+  reviewed repository and resolved Git metadata, with subprocess network access
+  blocked. Claude uses the runner's exact command templates; permissions cover
+  those read-only forms, not blanket Bash or Git access. Claude's built-in
+  permission logic may also approve other read-only utilities; the review prompt
+  still instructs the worker to use only the supplied Git forms. Write/edit tools are
+  unavailable and mutation commands are not
+  authorized. Private runtime working/configuration paths may still be written
+  for bookkeeping. Safe/restricted controls, empty MCP configuration, and
+  `dontAsk` remain enabled; managed policy remains in effect.
+- A completed request is not approval. Failed, malformed, timed-out, stale, or
+  insufficient-context reviews are distinguished. If the selected live scope
+  changes during review, the effective outcome becomes `insufficient-context` (exit 2)
+  while the original findings are preserved.
+  Content-preserving touches or atomic saves do not invalidate live reviews
+  when file kind, contents, and permissions remain the same.
+- The reviewer cannot run tests or a browser. Validate findings before applying
+  fixes and include existing verification results in the review context.
 
-The [skill](plugins/claude-adversarial-review/skills/claude-adversarial-review/SKILL.md)
-defines the workflow. This is an independent project, not an official Anthropic
-or OpenAI plugin.
+This is an independent project, not an official Anthropic or OpenAI plugin.
