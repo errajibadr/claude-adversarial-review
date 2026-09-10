@@ -1,0 +1,28 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "autoAllowBashIfSandboxed": false,
+    "excludedCommands": [],
+    "enableWeakerNestedSandbox": false,
+    "enableWeakerNetworkIsolation": false,
+    "allowAppleEvents": false,
+    "filesystem": {
+      "disabled": false,
+      "denyWrite": [],
+      "allowWrite": [],
+      "denyRead": [],
+      "allowRead": []
+    },
+    "network": {
+      "allowedDomains": [],
+      "deniedDomains": ["*"],
+      "strictAllowlist": true,
+      "allowAllUnixSockets": false,
+      "allowUnixSockets": [],
+      "allowLocalBinding": false,
+      "allowMachLookup": []
+    }
+  }
+}

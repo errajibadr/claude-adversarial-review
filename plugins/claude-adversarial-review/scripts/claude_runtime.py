@@ -9,6 +9,7 @@ import re
 import selectors
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -23,6 +24,26 @@ MAX_STREAM_BYTES = 32 * 1024 * 1024
 MAX_STDERR_BYTES = 1024 * 1024
 MAX_PROMPT_BYTES = 512 * 1024
 READ_TOOLS = frozenset({"Read", "Glob", "Grep"})
+HOST_SANDBOX_MODES = ("restricted", "full-access", "unknown")
+DEFAULT_SANDBOX_SETTINGS = Path(__file__).resolve().parents[1] / "settings" / "sandbox.json"
+REQUIRED_SANDBOX = {
+    "enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
+    "autoAllowBashIfSandboxed": False, "excludedCommands": [],
+    "enableWeakerNestedSandbox": False, "enableWeakerNetworkIsolation": False,
+    "allowAppleEvents": False,
+}
+SANDBOX_FIELDS = {
+    "sandbox": {
+        **{key: type(value) for key, value in REQUIRED_SANDBOX.items()},
+        "filesystem": {
+            "disabled": bool, "allowRead": list, "denyRead": list, "allowWrite": list, "denyWrite": list,
+        },
+        "network": {
+            "allowedDomains": list, "deniedDomains": list, "strictAllowlist": bool,
+            "allowAllUnixSockets": bool, "allowUnixSockets": list, "allowLocalBinding": bool, "allowMachLookup": list,
+        },
+    },
+}
 REQUIRED_DENIES = (
     "Cd",
     "Edit",
@@ -120,6 +141,69 @@ def live_git_commands(
     return {"exact": exact, "operand_prefixes": operands}
 
 
+def _validate_sandbox_requirements(sandbox: dict[str, Any], host_sandbox_mode: str) -> None:
+    if host_sandbox_mode not in HOST_SANDBOX_MODES:
+        raise ValueError("Unsupported originating host sandbox mode.")
+    if type(sandbox.get("enabled")) is not bool or (host_sandbox_mode != "full-access" and not sandbox["enabled"]):
+        raise ValueError("Bash sandboxing is required unless the originating host task is explicitly declared full-access.")
+    if any(sandbox.get(key) != value for key, value in REQUIRED_SANDBOX.items() if key != "enabled") or sandbox["filesystem"].get("disabled") is not False:
+        raise ValueError("Custom settings must preserve fixed sandbox fallback and review-only tool restrictions.")
+
+
+def load_sandbox_settings(override: Path | None = None, *, host_sandbox_mode: str = "unknown") -> dict[str, Any]:
+    """Read one explicit overlay; never discover settings in the reviewed checkout."""
+    def read(path: Path) -> dict[str, Any]:
+        try:
+            descriptor = os.open(path.expanduser(), os.O_RDONLY | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise ValueError
+                raw = stream.read(65537)
+            if len(raw) > 65536:
+                raise ValueError
+            settings = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+            if not isinstance(settings, dict) or set(settings) != {"sandbox"} or not isinstance(settings["sandbox"], dict):
+                raise ValueError
+            return settings
+        except (OSError, ValueError, RuntimeFailure, RecursionError) as exc:
+            raise ValueError("Sandbox settings must be a regular UTF-8 JSON file of at most 64 KiB containing only a sandbox object.") from exc
+
+    def merge(base: dict[str, Any], changes: Any, fields: dict[str, Any], *, complete: bool = False) -> None:
+        if not isinstance(changes, dict) or not changes.keys() <= fields.keys() or (complete and changes.keys() != fields.keys()):
+            raise ValueError("Sandbox settings contain an unsupported section or field; use the bundled settings/sandbox.json as the template.")
+        for key, value in changes.items():
+            expected = fields[key]
+            if isinstance(expected, dict):
+                merge(base.setdefault(key, {}), value, expected, complete=complete)
+            elif type(value) is not expected or (
+                isinstance(value, list)
+                and any(not isinstance(item, str) or not item or any(ord(c) < 32 or ord(c) == 127 for c in item) for item in value)
+            ):
+                raise ValueError("Sandbox settings require booleans and lists of nonempty strings without control characters.")
+            else:
+                base[key] = value
+
+    settings: dict[str, Any] = {}
+    merge(settings, read(DEFAULT_SANDBOX_SETTINGS), SANDBOX_FIELDS, complete=True)
+    if override is not None:
+        merge(settings, read(override), SANDBOX_FIELDS)
+    sandbox = settings["sandbox"]
+    _validate_sandbox_requirements(sandbox, host_sandbox_mode)
+    for section, names in ((sandbox["filesystem"], ("allowRead", "denyRead", "allowWrite", "denyWrite")), (sandbox["network"], ("allowUnixSockets",))):
+        for name in names:
+            paths = []
+            for value in section[name]:
+                try:
+                    path = Path(value).expanduser()
+                    if not path.is_absolute() or ("Write" in name and any(c in value for c in "*?[]{}")):
+                        raise ValueError
+                    paths.append(str(path.resolve()))
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise ValueError("Sandbox paths must resolve to absolute or ~/ paths; write paths cannot contain wildcards.") from exc
+            section[name] = list(dict.fromkeys(paths))
+    return settings
+
+
 def build_live_policy(
     repo: Path,
     git_dirs: Sequence[Path],
@@ -127,6 +211,8 @@ def build_live_policy(
     scope: str = "working-tree",
     head_commit: str | None = None,
     merge_base: str | None = None,
+    sandbox_settings: dict[str, Any] | None = None,
+    host_sandbox_mode: str = "unknown",
 ) -> dict[str, Any]:
     """Build a deterministic policy without launching processes or writing files."""
     repository = str(repo.resolve())
@@ -134,6 +220,10 @@ def build_live_policy(
     commands = live_git_commands(repo, scope=scope, head_commit=head_commit, merge_base=merge_base)
     approvals = [f"Bash({command})" for command in commands["exact"]]
     approvals.extend(f"Bash({prefix} *)" for prefix in commands["operand_prefixes"])
+    sandbox = json.loads(json.dumps(sandbox_settings if sandbox_settings is not None else load_sandbox_settings()))["sandbox"]
+    _validate_sandbox_requirements(sandbox, host_sandbox_mode)
+    for key in ("denyWrite", "allowRead"):
+        sandbox["filesystem"][key] = list(dict.fromkeys([*sandbox["filesystem"][key], *roots]))
     return {
         "permissions": {
             "allow": [*sorted(READ_TOOLS), *approvals],
@@ -141,26 +231,7 @@ def build_live_policy(
             "additionalDirectories": [repository],
             "blockReadsOutsideWorkingDirectories": True,
         },
-        "sandbox": {
-            "enabled": True,
-            "failIfUnavailable": True,
-            "allowUnsandboxedCommands": False,
-            "autoAllowBashIfSandboxed": False,
-            "excludedCommands": [],
-            "enableWeakerNestedSandbox": False,
-            "enableWeakerNetworkIsolation": False,
-            "allowAppleEvents": False,
-            "filesystem": {"disabled": False, "denyWrite": roots, "allowWrite": [], "allowRead": roots},
-            "network": {
-                "allowedDomains": [],
-                "deniedDomains": ["*"],
-                "strictAllowlist": True,
-                "allowAllUnixSockets": False,
-                "allowUnixSockets": [],
-                "allowLocalBinding": False,
-                "allowMachLookup": [],
-            },
-        },
+        "sandbox": sandbox,
     }
 
 
@@ -217,7 +288,7 @@ def _platform() -> str:
         except OSError:
             pass
         return "linux"
-    raise RuntimeFailure("Live review requires the native sandbox on macOS, Linux, or WSL2.")
+    raise RuntimeFailure("Live review is supported on macOS, Linux, or WSL2.")
 
 
 def verify_effective_policy(response: Any, policy: dict[str, Any]) -> dict[str, Any]:
@@ -228,8 +299,10 @@ def verify_effective_policy(response: Any, policy: dict[str, Any]) -> dict[str, 
     effective = _mapping(body.get("effective"), "settings")
     sandbox = _mapping(effective.get("sandbox"), "sandbox")
     expected = _mapping(policy.get("sandbox"), "requested sandbox")
+    enabled = sandbox.get("enabled")
+    if type(enabled) is not bool or (expected["enabled"] and not enabled):
+        raise RuntimeFailure("Effective sandbox.enabled conflicts with the review policy; review was not submitted.")
     for key in (
-        "enabled",
         "failIfUnavailable",
         "allowUnsandboxedCommands",
         "autoAllowBashIfSandboxed",
@@ -241,7 +314,7 @@ def verify_effective_policy(response: Any, policy: dict[str, Any]) -> dict[str, 
             raise RuntimeFailure(f"Effective sandbox.{key} conflicts with the review policy; review was not submitted.")
     platform = _platform()
     platforms = sandbox.get("enabledPlatforms")
-    if platforms is not None and platform not in _string_list(platforms, "sandbox platforms"):
+    if enabled and platforms is not None and platform not in _string_list(platforms, "sandbox platforms"):
         raise RuntimeFailure("Managed policy disables the sandbox on this platform; review was not submitted.")
     if _string_list(sandbox.get("excludedCommands", []), "sandbox exclusions"):
         raise RuntimeFailure("Effective policy includes unsandboxed command exclusions; review was not submitted.")
@@ -253,8 +326,11 @@ def verify_effective_policy(response: Any, policy: dict[str, Any]) -> dict[str, 
     writes = _string_list(filesystem.get("denyWrite"), "write restrictions")
     if not set(expected["filesystem"]["denyWrite"]).issubset(writes):
         raise RuntimeFailure("Effective policy does not protect the repository and Git metadata from writes; review was not submitted.")
-    if _string_list(filesystem.get("allowWrite", []), "write grants"):
-        raise RuntimeFailure("Effective policy adds filesystem write grants; review was not submitted.")
+    for key in ("allowWrite", "denyRead"):
+        actual = set(_string_list(filesystem.get(key, []), key))
+        requested = set(expected["filesystem"][key])
+        if not (requested <= actual if key == "denyRead" else requested == actual):
+            raise RuntimeFailure(f"Effective sandbox.filesystem.{key} conflicts with the review policy; review was not submitted.")
     reads = _string_list(filesystem.get("allowRead", []), "read grants")
     if set(reads) != set(expected["filesystem"]["allowRead"]):
         raise RuntimeFailure("Effective policy changes the review's filesystem read grants; review was not submitted.")
@@ -262,11 +338,11 @@ def verify_effective_policy(response: Any, policy: dict[str, Any]) -> dict[str, 
     for key in ("strictAllowlist", "allowAllUnixSockets", "allowLocalBinding"):
         if network.get(key) is not expected["network"][key]:
             raise RuntimeFailure(f"Effective sandbox.network.{key} conflicts with the review policy; review was not submitted.")
-    if "*" not in _string_list(network.get("deniedDomains"), "network restrictions"):
-        raise RuntimeFailure("Effective policy does not deny all subprocess network destinations; review was not submitted.")
-    for key in ("allowUnixSockets", "allowMachLookup"):
-        if _string_list(network.get(key, []), key):
-            raise RuntimeFailure("Effective policy permits additional interprocess connections; review was not submitted.")
+    for key in ("allowedDomains", "deniedDomains", "allowUnixSockets", "allowMachLookup"):
+        actual = set(_string_list(network.get(key, []), key))
+        requested = set(expected["network"][key])
+        if not (requested <= actual if key == "deniedDomains" else requested == actual):
+            raise RuntimeFailure(f"Effective sandbox.network.{key} conflicts with the review policy; review was not submitted.")
     if any(network.get(key) is not None for key in ("httpProxyPort", "socksProxyPort", "tlsTerminate")):
         raise RuntimeFailure("Effective policy replaces the sandbox network proxy; review was not submitted.")
     permissions = _mapping(effective.get("permissions"), "permissions")
@@ -291,11 +367,23 @@ def verify_effective_policy(response: Any, policy: dict[str, Any]) -> dict[str, 
         raise RuntimeFailure("Claude loaded user or repository settings despite restricted mode; review was not submitted.")
     return {
         "verified": True,
+        "verification_scope": "Claude-reported configuration",
+        "os_enforcement_verified": False,
+        "requested_sandbox_enabled": expected["enabled"],
+        "configured_sandbox_enabled": enabled,
         "platform": platform,
         "sources": names,
         "write_deny_count": len(writes),
-        "network": "subprocess destinations denied",
-        "unsandboxed_commands": False,
+        "network": (
+            "inactive: sandbox disabled" if not enabled else
+            "subprocess destinations denied by configuration"
+            if "*" in network.get("deniedDomains", [])
+            and not any(network.get(key) for key in ("allowAllUnixSockets", "allowUnixSockets", "allowLocalBinding", "allowMachLookup"))
+            else "custom subprocess network policy"
+        ),
+        "additional_write_grants": len(filesystem.get("allowWrite", [])),
+        "filesystem_protection": "configured" if enabled else "inactive: sandbox disabled",
+        "unsandboxed_commands": not enabled,
     }
 
 

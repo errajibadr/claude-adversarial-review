@@ -22,8 +22,14 @@ from typing import Any, NoReturn, Protocol, cast
 
 MAX_PROMPT_BYTES = 512 * 1024
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+SANDBOX_SETTINGS_ENV = "CLAUDE_ADVERSARIAL_REVIEW_SANDBOX_SETTINGS"
 DEFAULT_FOCUS = (
     "security, performance, code correctness, frontend and accessibility, architecture, reliability, privacy, compatibility, testing, operations"
+)
+HOST_ACCESS_NOTICE = (
+    "Host launch runs the review runner, Git collection, and Claude outside Codex's sandbox. "
+    "When enabled, Claude's sandbox covers Bash tool subprocesses, not the entire Claude process. "
+    "The calling host must authorize this boundary; the runner cannot change or verify its enclosing sandbox."
 )
 
 
@@ -217,7 +223,9 @@ def live_scope(metadata: dict[str, Any]) -> dict[str, Any]:
     return {key: metadata.get(key) for key in ("scope", "head_commit", "merge_base")}
 
 
-def live_policy(context: ReviewContext) -> dict[str, Any]:
+def live_policy(
+    context: ReviewContext, sandbox_settings: dict[str, Any] | None = None, *, host_sandbox_mode: str = "unknown",
+) -> dict[str, Any]:
     """Build the required live-tool restrictions using captured Git directory locations."""
     metadata = context.metadata
     runtime = installed_module("claude_runtime")
@@ -227,6 +235,8 @@ def live_policy(context: ReviewContext) -> dict[str, Any]:
             runtime.build_live_policy(
                 Path(metadata["repo_root"]),
                 [Path(metadata["git_dir"]), Path(metadata["git_common_dir"])],
+                sandbox_settings=sandbox_settings,
+                host_sandbox_mode=host_sandbox_mode,
                 **live_scope(metadata),
             ),
         )
@@ -234,11 +244,13 @@ def live_policy(context: ReviewContext) -> dict[str, Any]:
         raise ValueError(str(exc)) from exc
 
 
-def command(model: str, *, repository: bool = False, context: ReviewContext | None = None) -> list[str]:
-    """Select live sandboxed inspection, explicit snapshot reads, or tool-free packet review."""
+def command(
+    model: str, *, repository: bool = False, context: ReviewContext | None = None, policy: dict[str, Any] | None = None,
+) -> list[str]:
+    """Select live inspection, explicit snapshot reads, or tool-free packet review."""
     schema = json.loads((PLUGIN_ROOT / "schemas" / "review-output.schema.json").read_text(encoding="utf-8"))
     if context is not None and context.metadata.get("context_mode") == "live":
-        argv = installed_module("claude_runtime").live_cli_arguments(live_policy(context), Path(context.metadata["repo_root"]))
+        argv = installed_module("claude_runtime").live_cli_arguments(policy if policy is not None else live_policy(context), Path(context.metadata["repo_root"]))
         return [*argv, "--model", model, "--json-schema", json.dumps(schema)]
     argv = [
         "claude",
@@ -446,10 +458,16 @@ def run_review(
     output_parent: Path | None,
     *,
     context: ReviewContext | None = None,
+    sandbox_settings: dict[str, Any] | None = None,
+    sandbox_settings_source: str | None = None,
+    host_sandbox_mode: str = "unknown",
 ) -> tuple[Path, int]:
     """Retain private artifacts and distinguish execution failure from review findings."""
     is_live = context is not None and context.metadata.get("context_mode") == "live"
-    argv = command(model, repository=context is not None, context=context)
+    if sandbox_settings is not None and not is_live:
+        raise ValueError("Sandbox settings apply only to live repository reviews.")
+    policy = live_policy(context, sandbox_settings, host_sandbox_mode=host_sandbox_mode) if is_live and context is not None else None
+    argv = command(model, repository=context is not None, context=context, policy=policy)
     cli_error = check_cli(PLUGIN_ROOT, live=is_live)
     if cli_error:
         raise ValueError(cli_error)
@@ -468,6 +486,14 @@ def run_review(
         "timeout_seconds": timeout,
         "returncode": None,
         "command": argv,
+        "sandbox_settings_source": (
+            sandbox_settings_source or ("provided settings object" if sandbox_settings is not None else "bundled settings/sandbox.json")
+        ) if is_live else None,
+        "execution_boundary": "Chosen by the calling host; enclosing sandbox not verified by the runner.",
+        "declared_host_sandbox_mode": host_sandbox_mode,
+        "host_mode_verified": False,
+        "requested_sandbox_enabled": policy["sandbox"]["enabled"] if policy is not None else None,
+        "claude_sandbox_scope": "Bash tool subprocesses (when enabled)" if is_live else "No Bash tools granted",
         "context": context_metadata,
         "review_verdict": None,
         "effective_verdict": None,
@@ -489,7 +515,7 @@ def run_review(
     try:
         if context and not is_live:
             context.write_snapshot(snapshot)
-        if is_live and context is not None:
+        if is_live and context is not None and policy is not None:
             metadata.update(status="running", execution_status="running")
             save_metadata()
 
@@ -502,7 +528,7 @@ def run_review(
                     argv,
                     packet,
                     Path(launcher_name),
-                    live_policy(context),
+                    policy,
                     timeout,
                     output / "events.jsonl",
                     output / "stderr.log",
@@ -647,6 +673,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--focus", default=DEFAULT_FOCUS, help="Review focus or selected lenses.")
     parser.add_argument("--model", type=model_name, default="opus")
     parser.add_argument(
+        "--sandbox-settings", type=Path,
+        help=f"Live mode only: JSON overlay; overrides {SANDBOX_SETTINGS_ENV}. Mandatory review protections remain enabled.",
+    )
+    parser.add_argument(
+        "--host-sandbox-mode", choices=("restricted", "full-access", "unknown"), default="unknown",
+        help="Original calling task mode, retained across host launch. Only full-access permits disabling the live Bash sandbox; unknown requires it.",
+    )
+    parser.add_argument(
         "--timeout",
         type=positive_timeout,
         default=300.0,
@@ -665,8 +699,27 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.prompt_file and any(value is not None for value in (args.repo, args.scope, args.base, args.path, args.exclude, args.context_mode)):
         parser.error("--prompt-file cannot be combined with --repo, --scope, --base, --path, --exclude, or --context-mode.")
+    if args.sandbox_settings is not None and (args.prompt_file is not None or args.context_mode == "snapshot"):
+        parser.error("--sandbox-settings is only supported with live repository reviews.")
+    print(f"Execution boundary notice: {HOST_ACCESS_NOTICE}", file=sys.stderr)
     context: ReviewContext | None = None
+    sandbox_settings: dict[str, Any] | None = None
+    settings_source = "bundled settings/sandbox.json"
     try:
+        if args.prompt_file is None and args.context_mode != "snapshot" and args.sandbox_settings is None:
+            configured_path = os.environ.get(SANDBOX_SETTINGS_ENV)
+            if configured_path:
+                if not Path(configured_path).is_absolute() and not configured_path.startswith("~/"):
+                    raise ValueError(f"{SANDBOX_SETTINGS_ENV} must name an absolute or ~/ settings file path.")
+                args.sandbox_settings = Path(configured_path)
+        if args.sandbox_settings is not None:
+            try:
+                args.sandbox_settings = args.sandbox_settings.expanduser().resolve()
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise ValueError("The sandbox settings file path could not be resolved.") from exc
+            settings_source = str(args.sandbox_settings)
+        if args.prompt_file is None and args.context_mode != "snapshot":
+            sandbox_settings = installed_module("claude_runtime").load_sandbox_settings(args.sandbox_settings, host_sandbox_mode=args.host_sandbox_mode)
         if args.output_dir is not None and not args.output_dir.is_dir():
             raise ValueError("Output parent must be an existing directory.")
         if args.prompt_file:
@@ -692,7 +745,8 @@ def main(argv: list[str] | None = None) -> int:
                 else "Repository change evidence in the private context snapshot."
             )
         packet = compose_prompt(evidence, args.focus, metadata, target)
-        argv_preview = command(args.model, repository=context is not None, context=context)
+        policy = live_policy(context, sandbox_settings, host_sandbox_mode=args.host_sandbox_mode) if sandbox_settings is not None and context is not None else None
+        argv_preview = command(args.model, repository=context is not None, context=context, policy=policy)
     except (OSError, ValueError) as exc:
         detail = str(exc) if isinstance(exc, ValueError) else "Could not read the input, installed plugin resources, or output parent."
         print(f"Review preflight failed: {detail} No review artifacts were created.", file=sys.stderr)
@@ -707,6 +761,11 @@ def main(argv: list[str] | None = None) -> int:
                     "command": argv_preview,
                     "prompt_bytes": len(packet),
                     "context": metadata,
+                    "sandbox_settings_source": settings_source if sandbox_settings is not None else None,
+                    "declared_host_sandbox_mode": args.host_sandbox_mode,
+                    "host_mode_verified": False,
+                    "requested_sandbox_enabled": policy["sandbox"]["enabled"] if policy is not None else None,
+                    "execution_boundary_notice": HOST_ACCESS_NOTICE,
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -714,7 +773,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     try:
-        output, exit_code = run_review(packet, args.model, args.timeout, args.output_dir, context=context)
+        output, exit_code = run_review(
+            packet, args.model, args.timeout, args.output_dir, context=context,
+            sandbox_settings=sandbox_settings, sandbox_settings_source=settings_source,
+            host_sandbox_mode=args.host_sandbox_mode,
+        )
     except ValueError as exc:
         print(f"Review failed: {exc} If an artifact path was printed, inspect that directory.", file=sys.stderr)
         return 1

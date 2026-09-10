@@ -28,6 +28,21 @@ Runner validates findings + checks live scope is unchanged
 Original report and effective outcome return to the assistant
 ```
 
+## Before installing: execution boundary
+
+**An approved host launch runs the Python runner, Git evidence collection, and
+Claude's main process outside Codex's sandbox.** Claude's own sandbox confines
+its Bash commands by default; Read, Glob, and Grep use application permission
+checks. Only an originally full-access task may select a configuration that
+disables the Bash sandbox. That removes its OS filesystem and network enforcement;
+read-only command and tool rules remain. The whole reviewer is not inside
+Codex's sandbox.
+
+Installing the plugin does not grant host access. The calling assistant must use
+the host's native authorization flow, honoring any authorization already given.
+The plugin does not change global permission rules or escape an enclosing
+sandbox itself. Review the boundary before authorizing host execution.
+
 ## Install in Codex
 
 Add this Git URL in the Codex app's plugin marketplace dialog:
@@ -57,9 +72,9 @@ installation.
 
 Prerequisites: Python 3.12+, Git, and authenticated Claude Code. The live protocol
 was tested with Claude Code 2.1.261. The runner checks the CLI's reported effective
-configuration and provenance before sending the prompt; Claude's native sandbox
-and `failIfUnavailable` provide enforcement. This assumes a trusted, functioning
-CLI, not a stable protocol across versions or proof against a broken or malicious
+configuration and provenance before sending the prompt; when enabled, Claude's
+native sandbox and `failIfUnavailable` provide OS enforcement. This assumes a
+trusted, functioning CLI, not a stable protocol across versions or proof against a broken or malicious
 binary. Snapshot and packet modes also require the supported safe/restricted
 controls. Check `claude --version` and `claude auth status`. No Python package
 dependencies are required.
@@ -143,6 +158,22 @@ repository scope options. See the [runner documentation](plugins/claude-adversar
 for collection limits, result handling, and examples. The `make check` and
 `make review` shortcuts remain available from a source checkout.
 
+Live reviews use the bundled
+[Bash sandbox defaults](plugins/claude-adversarial-review/settings/sandbox.json).
+Set `CLAUDE_ADVERSARIAL_REVIEW_SANDBOX_SETTINGS` to an absolute or `~/` file path
+to apply a partial override automatically. An explicit `--sandbox-settings FILE`
+takes precedence over that variable. Keep your file outside the installed plugin cache;
+the runner does not discover configuration in the repository being reviewed.
+See [customization, Codex environment setup, and fixed protections](plugins/claude-adversarial-review/README.md#customize-the-live-bash-sandbox).
+This option does not enable tests or arbitrary commands.
+
+Pass `--host-sandbox-mode restricted|full-access|unknown` from the original
+task's permissions and preserve it through dry run and host escalation. The
+default, `unknown`, and `restricted` require the Bash sandbox to stay enabled.
+`full-access` permits a user-selected file to set `sandbox.enabled: false`;
+it does not turn the sandbox off automatically. The runner records this
+declaration but cannot verify it.
+
 ## Scope and limits
 
 - **Live mode gives access to the actual repository.** `--path`, `--exclude`,
@@ -161,9 +192,12 @@ for collection limits, result handling, and examples. The `make check` and
 - Omitted contents may still have path names listed in the inventory. Filename
   filters do not detect secrets. Use a curated packet when those names or
   ordinary-looking source files contain sensitive material.
-- Live Git runs through Claude's native Bash sandbox, denying writes to the
-  reviewed repository and resolved Git metadata, with subprocess network access
-  blocked. Claude uses the runner's exact command templates; permissions cover
+- By default, live Git runs through Claude's native Bash sandbox, denying writes
+  to the reviewed repository and resolved Git metadata and blocking subprocess
+  network access. Custom settings can change network access; a permitted explicit
+  sandbox disablement removes OS filesystem/network enforcement even though
+  deny fields remain in the configuration. Claude uses
+  the runner's exact command templates; permissions cover
   those read-only forms, not blanket Bash or Git access. Claude's built-in
   permission logic may also approve other read-only utilities; the review prompt
   still instructs the worker to use only the supplied Git forms. Write/edit tools are
@@ -171,6 +205,18 @@ for collection limits, result handling, and examples. The `make check` and
   authorized. Private runtime working/configuration paths may still be written
   for bookkeeping. Safe/restricted controls, empty MCP configuration, and
   `dontAsk` remain enabled; managed policy remains in effect.
+- The host decides where the runner executes. For the approved host workflow,
+  both the runner and Claude's main process run outside Codex's sandbox.
+  The original task's declared mode determines whether the Bash sandbox must
+  remain enabled; host-launch approval does not change that mode. Tool
+  restrictions remain fixed. If host execution is unavailable or not authorized,
+  report a blocked review. Do not
+  repeatedly attempt authentication in a sandbox already known to hide the login.
+- Keep suitable repository sandbox settings for normal interactive Claude
+  sessions. This reviewer deliberately uses `--restricted`, which ignores normal
+  user and repository settings; its explicit session policy and managed settings
+  apply instead. A sandbox override affects Bash, not the fixed access grants
+  for Claude's built-in file tools.
 - A completed request is not approval. Failed, malformed, timed-out, stale, or
   insufficient-context reviews are distinguished. If the selected live scope
   changes during review, the effective outcome becomes `insufficient-context` (exit 2)

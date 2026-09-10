@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Claude Adversarial Review",
     "shortDescription": "Independent Claude reviews of code and design.",
-    "longDescription": "Review Git changes or a selected evidence packet for security, performance, correctness, frontend, accessibility, and architecture risks through the installed Claude Code CLI.",
+    "longDescription": "Independent reviews through your installed Claude Code CLI. An approved host launch runs the Python runner, Git collection, and Claude's main process outside Codex's sandbox. Bash is sandboxed by default; only a declared originally full-access task may explicitly disable it, losing OS filesystem/network enforcement. Read-only command and tool rules remain. Read, Glob, and Grep use application permission checks. Installation grants no host access; native authorization still applies. The runner records but cannot verify the original host-mode declaration.",
     "developerName": "errajibadr",
     "category": "Productivity",
     "capabilities": [],
